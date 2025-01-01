@@ -1,4 +1,5 @@
 import numpy as np
+import os
 import pytorch_lightning as pl
 import torch.nn as nn
 import torch
@@ -6,72 +7,15 @@ from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
 from pytorch_lightning.callbacks import (
     ModelCheckpoint,
+    EarlyStopping,
     LearningRateMonitor,
     ModelSummary,
 )
 from pytorch_lightning.loggers import WandbLogger
 from model import IJEPA_base
-from pretrain_IJPEA import IJEPA
+from pretrain_IJEPA import IJEPA
 
-
-'''Dummy Dataset'''
-class IJEPADataset(Dataset):
-    def __init__(self,
-                 dataset_path,
-                 stage='train',
-                 ):
-        super().__init__()
-        img1 =torch.randn(3, 224, 224)
-        self.data = img1.repeat(100, 1, 1, 1)
-        label = torch.tensor([0., 0., 0., 1., 0.])
-        self.label = label.repeat(100, 1)
-        
-    def __len__(self):
-        return len(self.data)
-    
-    def __getitem__(self, index):
-        return self.data[index], self.label[index]
-    
-'''
-Placeholder for datamodule in pytorch lightning
-'''
-class D2VDataModule(pl.LightningDataModule):
-    def __init__(self,
-                 dataset_path,
-                 batch_size=16,
-                 num_workers=4,
-                 pin_memory=True,
-                 shuffle=True
-                 ):
-        super().__init__()
-        
-        self.dataset_path = dataset_path
-        self.batch_size = batch_size
-        self.num_workers = num_workers
-        self.pin_memory = pin_memory
-        self.shuffle = shuffle
-        
-    def setup(self, stage=None):
-        self.train_dataset = IJEPADataset(dataset_path=self.dataset_path, stage='train')
-        self.val_dataset = IJEPADataset(dataset_path=self.dataset_path, stage='val')
-        
-    def train_dataloader(self):
-        return DataLoader(
-            self.train_dataset,
-            batch_size=self.batch_size,
-            num_workers=self.num_workers,
-            pin_memory=self.pin_memory,
-            shuffle=self.shuffle,
-        )
-    
-    def val_dataloader(self):
-        return DataLoader(
-            self.val_dataset,
-            batch_size=self.batch_size,
-            num_workers=self.num_workers,
-            pin_memory=self.pin_memory,
-            shuffle=False,
-        )
+from datamodules import ZipDataModule
 
 '''
 Finetune IJEPA
@@ -89,7 +33,10 @@ class IJEPA_FT(pl.LightningModule):
         self.drop_path = drop_path
 
         #define model layers
-        self.pretrained_model = IJEPA.load_from_checkpoint(pretrained_model_path)
+        if pretrained_model_path is None: # if no pretrained model path is given, create a new model
+            self.pretrained_model = IJEPA(img_size=224, patch_size=16, in_chans=3, embed_dim=64, enc_heads=8, enc_depth=8, decoder_depth=6, lr=1e-3)
+        else:
+            self.pretrained_model = IJEPA.load_from_checkpoint(pretrained_model_path)
         self.pretrained_model.model.mode = "test"
         self.pretrained_model.model.layer_dropout = self.drop_path
         self.average_pool = nn.AvgPool1d((self.pretrained_model.embed_dim), stride=1)
@@ -134,20 +81,31 @@ class IJEPA_FT(pl.LightningModule):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
         return optimizer
 
+# python3 finetune_IJEPA.py
 if __name__ == '__main__':
-    dataset = D2VDataModule(dataset_path='data')
+    import pandas as pd
+    zip_df = pd.read_csv('supervised_zipfiles.csv')
+    datamodule = ZipDataModule(dataset_df=zip_df, num_classes=2)
 
-    model = IJEPA_FT(pretrained_model_path='.ckpt', num_classes=5)
+    experiment_name = 'early_pretrained'
+
+    #model = IJEPA_FT(pretrained_model_path=None, num_classes=2)
+    model = IJEPA_FT(pretrained_model_path='pretrain/pretrain-epoch=00-val_loss=0.02.ckpt', num_classes=2)
+
+    tensorboard_logger = pl.loggers.TensorBoardLogger('tb_logs/finetune/', default_hp_metric=False, name=experiment_name)
 
     lr_monitor = LearningRateMonitor(logging_interval="step")
-    model_summary = ModelSummary(max_depth=2)
+    model_checkpoint = ModelCheckpoint(monitor='val_loss', save_top_k=1, mode='min', dirpath=os.path.join('finetune',experiment_name), filename='finetune-{epoch:02d}-{val_loss:.2f}')
+    early_stopping = EarlyStopping(monitor='val_loss', patience=5, mode='min')
+    #model_summary = ModelSummary(max_depth=2)
 
     trainer = pl.Trainer(
-        accelerator='cpu',
-        precision=16,
-        max_epochs=10,
-        callbacks=[lr_monitor, model_summary],
+        accelerator='gpu',
+        precision='16-mixed',
+        max_epochs=50,
+        callbacks=[lr_monitor, model_checkpoint, early_stopping],#, model_summary],
+        logger=tensorboard_logger,
         gradient_clip_val=.1,
     )
 
-    trainer.fit(model, dataset)
+    trainer.fit(model, datamodule)

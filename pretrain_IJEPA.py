@@ -1,77 +1,19 @@
 import numpy as np
+import os
 import pytorch_lightning as pl
 import torch.nn as nn
 import torch
-from torch.utils.data import Dataset
-from torch.utils.data import DataLoader
+torch.set_float32_matmul_precision('medium')
+
 from pytorch_lightning.callbacks import (
-    ModelCheckpoint,
     LearningRateMonitor,
+    ModelCheckpoint,
     ModelSummary,
 )
-from pytorch_lightning.loggers import WandbLogger
-from model import IJEPA_base
+from model import IJEPA_base 
+from datamodules import ZipDataModule
 
 
-'''Dummy Dataset'''
-class IJEPADataset(Dataset):
-    def __init__(self,
-                 dataset_path,
-                 stage='train',
-                 ):
-        super().__init__()
-        img1 =torch.randn(3, 224, 224)
-        self.data = img1.repeat(100, 1, 1, 1)
-        
-    def __len__(self):
-        return len(self.data)
-    
-    def __getitem__(self, index):
-        return self.data[index]
-
-
-'''Placeholder for datamodule in pytorch lightning'''
-'''
-Placeholder for datamodule in pytorch lightning
-'''
-class D2VDataModule(pl.LightningDataModule):
-    def __init__(self,
-                 dataset_path,
-                 batch_size=16,
-                 num_workers=4,
-                 pin_memory=True,
-                 shuffle=True
-                 ):
-        super().__init__()
-        
-        self.dataset_path = dataset_path
-        self.batch_size = batch_size
-        self.num_workers = num_workers
-        self.shuffle = shuffle
-        
-    def setup(self, stage=None):
-        self.train_dataset = IJEPADataset(dataset_path=self.dataset_path, stage='train')
-        self.val_dataset = IJEPADataset(dataset_path=self.dataset_path, stage='val')
-        
-    def train_dataloader(self):
-        return DataLoader(
-            self.train_dataset,
-            batch_size=self.batch_size,
-            num_workers=self.num_workers,
-            shuffle=self.shuffle,
-        )
-    
-    def val_dataloader(self):
-        return DataLoader(
-            self.val_dataset,
-            batch_size=self.batch_size,
-            num_workers=self.num_workers,
-            shuffle=False,
-        )
-
-'''
-pytorch lightning model
-'''
 class IJEPA(pl.LightningModule):
     def __init__(
             self,
@@ -139,7 +81,7 @@ class IJEPA(pl.LightningModule):
 
         y_student, y_teacher = self(x, target_aspect_ratio, target_scale, context_aspect_ratio, context_scale)
         loss = self.criterion(y_student, y_teacher)
-        self.log('train_loss', loss)
+        self.log('train_loss', loss, on_epoch=True, prog_bar=True)
                     
         return loss
     
@@ -152,7 +94,7 @@ class IJEPA(pl.LightningModule):
 
         y_student, y_teacher = self(x, target_aspect_ratio, target_scale, context_aspect_ratio, context_scale)
         loss = self.criterion(y_student, y_teacher)
-        self.log('val_loss', loss)
+        self.log('val_loss', loss, on_epoch=True, prog_bar=True)
         
         return loss
     
@@ -172,11 +114,51 @@ class IJEPA(pl.LightningModule):
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=self.lr,
-            total_steps=self.trainer.estimated_stepping_batches,
-        )
+        if 0: # OneCycleLR
+            scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                optimizer,
+                max_lr=self.lr,
+                total_steps=self.trainer.estimated_stepping_batches,
+            )
+        elif 1: # ReduceLROnPlateau
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode='min',
+                monitor='train_loss',
+                factor=0.1,
+                patience=5,
+                verbose=True,
+                threshold=0.001,
+                threshold_mode='rel',
+                cooldown=0,
+                min_lr=0,
+                eps=1e-08,
+            )
+        elif 0: # exponential decay
+            scheduler = torch.optim.lr_scheduler.ExponentialLR(
+                optimizer,
+                gamma=0.95,
+            )
+        elif 0: # LambdaLR (borken)
+            scheduler = torch.optim.lr_scheduler.LambdaLR(
+                optimizer,
+                lr_lambda=lambda epoch: 0.95 ** epoch,
+            )
+        elif 0: # CosineAnnealingWarmRestarts
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                optimizer,
+                T_0=10,
+                T_mult=2,
+                eta_min=0,
+                last_epoch=-1,
+            )
+        else: # CosineAnnealingLR
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=10,
+                eta_min=0,
+                last_epoch=-1,
+            )
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
@@ -187,20 +169,28 @@ class IJEPA(pl.LightningModule):
 
 
 if __name__ == '__main__':
-    dataset = D2VDataModule(dataset_path='data')
+    import pandas as pd
+    zip_df = pd.read_csv('ssl_zipfiles.csv')
+    datamodule = ZipDataModule(dataset_df=zip_df, num_classes=None)
 
-    model = IJEPA(img_size=224, patch_size=16, in_chans=3, embed_dim=64, enc_heads=8, enc_depth=8, decoder_depth=6, lr=1e-3)
+    experiment_name = 'ExponentialLR'
+
+    model = IJEPA(img_size=224, patch_size=16, in_chans=3, embed_dim=64, enc_heads=8, enc_depth=8, decoder_depth=6, lr=1e-4)
     
+    tensorboard_logger = pl.loggers.TensorBoardLogger('tb_logs/pretrain/', default_hp_metric=False, name=experiment_name)
+
     lr_monitor = LearningRateMonitor(logging_interval="step")
-    model_summary = ModelSummary(max_depth=2)
+    model_checkpoint = ModelCheckpoint(monitor='val_loss', save_top_k=1, mode='min', dirpath=os.path.join('pretrain',experiment_name), filename=f'pretrain-{experiment_name}'+'{epoch:02d}-{val_loss:.2f}', save_last=True)
+    #model_summary = ModelSummary(max_depth=2)
 
     trainer = pl.Trainer(
         accelerator='gpu',
         devices=1,
-        precision=16,
-        max_epochs=10,
-        callbacks=[lr_monitor, model_summary],
+        precision='16-mixed',
+        max_epochs=20,
+        callbacks=[lr_monitor, model_checkpoint],#, model_summary],
+        logger=tensorboard_logger,
         gradient_clip_val=.1,
     )
 
-    trainer.fit(model, dataset)
+    trainer.fit(model, datamodule)

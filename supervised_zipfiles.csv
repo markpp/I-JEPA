@@ -1,0 +1,7 @@
+paths,split
+/home/markpp/Datasets/WeedJet/blobstorage/datasets/supervised/ipm/BE00001_corn_.zip,train
+/home/markpp/Datasets/WeedJet/blobstorage/datasets/supervised/ipm/Corn_2021_05.zip,train
+/home/markpp/Datasets/WeedJet/blobstorage/datasets/supervised/ipm/Corn_2021_06.zip,val
+/home/markpp/Datasets/WeedJet/blobstorage/datasets/supervised/ipm/Corn_2022_05.zip,test
+/home/markpp/Datasets/WeedJet/blobstorage/datasets/supervised/ipm/Corn_2022_06.zip,train
+/home/markpp/Datasets/WeedJet/blobstorage/datasets/supervised/ipm/Corn_2023_06.zip,train
